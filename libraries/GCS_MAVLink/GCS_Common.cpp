@@ -3950,6 +3950,44 @@ void GCS_MAVLINK::handle_message(const mavlink_message_t &msg)
         break;
     }
 
+    case MAVLINK_MSG_ID_CHARGE_CONTROLLER_STATUS: {
+        mavlink_charge_controller_status_t packet;
+        mavlink_msg_charge_controller_status_decode(&msg, &packet);
+        AP::logger().Write(
+            "SLR1", "TimeUS,SoC,BatV,BatA,BTmp,CTmp,LdV,LdA,LdW,PnlV,PnlA,PnlW", "QBffBBffBffB",
+            AP_HAL::micros64(),
+            packet.soc,
+            packet.battery_voltage,
+            packet.battery_charging_amps,
+            packet.battery_temperature,
+            packet.controller_temperature,
+            packet.load_voltage,
+            packet.load_amps,
+            packet.load_watts,
+            packet.solar_panel_voltage,
+            packet.solar_panel_amps,
+            packet.solar_panel_watts
+        );
+        AP::logger().Write(
+            "SLR2", "TimeUS,MnV,MxV,MxCA,MxDA,MxCW,MxDW,CAh,DAh,CWh,DWh,CUt,TBOC,TBFC", "QffffBBBBBBBBB",
+            AP_HAL::micros64(),
+            packet.min_battery_voltage_today,
+            packet.max_battery_voltage_today,
+            packet.max_charging_amps_today,
+            packet.max_discharging_amps_today,
+            packet.max_charge_watts_today,
+            packet.max_discharge_watts_today,
+            packet.charge_amphours_today,
+            packet.discharge_amphours_today,
+            packet.charge_watthours_today,
+            packet.discharge_watthours_today,
+            packet.controller_uptime_days,
+            packet.total_battery_overcharges,
+            packet.total_battery_fullcharges
+        );
+        break;
+    }
+
     case MAVLINK_MSG_ID_COMMAND_ACK: {
         handle_command_ack(msg);
         break;
