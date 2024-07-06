@@ -13,6 +13,10 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "AP_Arming_config.h"
+
+#if AP_ARMING_ENABLED
+
 #include "AP_Arming.h"
 #include <AP_HAL/AP_HAL.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
@@ -142,7 +146,7 @@ const AP_Param::GroupInfo AP_Arming::var_info[] = {
     // @Param: OPTIONS
     // @DisplayName: Arming options
     // @Description: Options that can be applied to change arming behaviour
-    // @Values: 0:None,1:Disable prearm display,2:Do not send status text on state change
+    // @Bitmask: 0:Disable prearm display,1:Do not send status text on state change
     // @User: Advanced
     AP_GROUPINFO("OPTIONS", 9,   AP_Arming, _arming_options, 0),
 
@@ -153,6 +157,15 @@ const AP_Param::GroupInfo AP_Arming::var_info[] = {
     // @Range: 0 500
     // @User: Advanced
     AP_GROUPINFO("MAGTHRESH", 10, AP_Arming, magfield_error_threshold,  AP_ARMING_MAGFIELD_ERROR_THRESHOLD),
+
+#if AP_ARMING_CRASHDUMP_ACK_ENABLED
+    // @Param: CRSDP_IGN
+    // @DisplayName: Disable CrashDump Arming check
+    // @Description: Must have value "1" if crashdump data is present on the system, or a prearm failure will be raised.  Do not set this parameter unless the risks of doing so are fully understood.  The presence of a crash dump means that the firmware currently installed has suffered a critical software failure which resulted in the autopilot immediately rebooting.  The crashdump file gives diagnostic information which can help in finding the issue, please contact the ArduPIlot support team.  If this crashdump data is present, the vehicle is likely unsafe to fly.  Check the ArduPilot documentation for more details.
+    // @Values: 0:Crash Dump arming check active, 1:Crash Dump arming check deactivated
+    // @User: Advanced
+    AP_GROUPINFO("CRSDP_IGN", 11, AP_Arming, crashdump_ack.acked, 0),
+#endif  // AP_ARMING_CRASHDUMP_ACK_ENABLED
 
     AP_GROUPEND
 };
@@ -180,6 +193,13 @@ AP_Arming::AP_Arming()
 // performs pre-arm checks. expects to be called at 1hz.
 void AP_Arming::update(void)
 {
+#if AP_ARMING_CRASHDUMP_ACK_ENABLED
+    // if we boot with no crashdump data present, reset the "ignore"
+    // parameter so the user will need to acknowledge future crashes
+    // too:
+    crashdump_ack.check_reset();
+#endif
+
     const uint32_t now_ms = AP_HAL::millis();
     // perform pre-arm checks & display failures every 30 seconds
     bool display_fail = false;
@@ -196,6 +216,19 @@ void AP_Arming::update(void)
 
     pre_arm_checks(display_fail);
 }
+
+#if AP_ARMING_CRASHDUMP_ACK_ENABLED
+void AP_Arming::CrashDump::check_reset()
+{
+    // if there is no crash dump data then clear the crash dump ack.
+    // This means on subsequent crash-dumps appearing the user must
+    // re-acknowledge.
+    if (hal.util->last_crash_dump_size() == 0) {
+        // no crash dump data
+        acked.set_and_save_ifchanged(0);
+    }
+}
+#endif  // AP_ARMING_CRASHDUMP_ACK_ENABLED
 
 uint16_t AP_Arming::compass_magfield_expected() const
 {
@@ -352,50 +385,22 @@ bool AP_Arming::logging_checks(bool report)
 #if AP_INERTIALSENSOR_ENABLED
 bool AP_Arming::ins_accels_consistent(const AP_InertialSensor &ins)
 {
-    const uint8_t accel_count = ins.get_accel_count();
-    if (accel_count <= 1) {
-        return true;
-    }
-
-    const Vector3f &prime_accel_vec = ins.get_accel();
     const uint32_t now = AP_HAL::millis();
-    for(uint8_t i=0; i<accel_count; i++) {
-        if (!ins.use_accel(i)) {
-            continue;
-        }
-        // get next accel vector
-        const Vector3f &accel_vec = ins.get_accel(i);
-        Vector3f vec_diff = accel_vec - prime_accel_vec;
-        // allow for user-defined difference, typically 0.75 m/s/s. Has to pass in last 10 seconds
-        float threshold = accel_error_threshold;
-        if (i >= 2) {
-            /*
-              we allow for a higher threshold for IMU3 as it
-              runs at a different temperature to IMU1/IMU2,
-              and is not used for accel data in the EKF
-            */
-            threshold *= 3;
-        }
-
-        // EKF is less sensitive to Z-axis error
-        vec_diff.z *= 0.5f;
-
-        if (vec_diff.length() > threshold) {
-            // this sensor disagrees with the primary sensor, so
-            // accels are inconsistent:
-            last_accel_pass_ms = 0;
-            return false;
-        }
+    if (!ins.accels_consistent(accel_error_threshold)) {
+        // accels are inconsistent:
+        last_accel_pass_ms = 0;
+        return false;
     }
 
     if (last_accel_pass_ms == 0) {
-        // we didn't return false in the loop above, so sensors are
+        // we didn't return false above, so sensors are
         // consistent right now:
         last_accel_pass_ms = now;
     }
 
+    // if accels can in theory be inconsistent,
     // must pass for at least 10 seconds before we're considered consistent:
-    if (now - last_accel_pass_ms < 10000) {
+    if (ins.get_accel_count() > 1 && now - last_accel_pass_ms < 10000) {
         return false;
     }
 
@@ -404,37 +409,23 @@ bool AP_Arming::ins_accels_consistent(const AP_InertialSensor &ins)
 
 bool AP_Arming::ins_gyros_consistent(const AP_InertialSensor &ins)
 {
-    const uint8_t gyro_count = ins.get_gyro_count();
-    if (gyro_count <= 1) {
-        return true;
-    }
-
-    const Vector3f &prime_gyro_vec = ins.get_gyro();
     const uint32_t now = AP_HAL::millis();
-    for(uint8_t i=0; i<gyro_count; i++) {
-        if (!ins.use_gyro(i)) {
-            continue;
-        }
-        // get next gyro vector
-        const Vector3f &gyro_vec = ins.get_gyro(i);
-        const Vector3f vec_diff = gyro_vec - prime_gyro_vec;
-        // allow for up to 5 degrees/s difference
-        if (vec_diff.length() > radians(5)) {
-            // this sensor disagrees with the primary sensor, so
-            // gyros are inconsistent:
-            last_gyro_pass_ms = 0;
-            return false;
-        }
+    // allow for up to 5 degrees/s difference
+    if (!ins.gyros_consistent(5)) {
+        // gyros are inconsistent:
+        last_gyro_pass_ms = 0;
+        return false;
     }
 
-    // we didn't return false in the loop above, so sensors are
+    // we didn't return false above, so sensors are
     // consistent right now:
     if (last_gyro_pass_ms == 0) {
         last_gyro_pass_ms = now;
     }
 
+    // if gyros can in theory be inconsistent,
     // must pass for at least 10 seconds before we're considered consistent:
-    if (now - last_gyro_pass_ms < 10000) {
+    if (ins.get_gyro_count() > 1 && now - last_gyro_pass_ms < 10000) {
         return false;
     }
 
@@ -612,7 +603,7 @@ bool AP_Arming::gps_checks(bool report)
 
         // Any failure messages from GPS backends
         char failure_msg[50] = {};
-        if (!AP::gps().backends_healthy(failure_msg, ARRAY_SIZE(failure_msg))) {
+        if (!AP::gps().pre_arm_checks(failure_msg, ARRAY_SIZE(failure_msg))) {
             if (failure_msg[0] != '\0') {
                 check_failed(ARMING_CHECK_GPS, report, "%s", failure_msg);
             }
@@ -620,7 +611,7 @@ bool AP_Arming::gps_checks(bool report)
         }
 
         for (uint8_t i = 0; i < gps.num_sensors(); i++) {
-#if defined(GPS_BLENDED_INSTANCE)
+#if AP_GPS_BLENDED_ENABLED
             if ((i != GPS_BLENDED_INSTANCE) &&
 #else
             if (
@@ -658,7 +649,7 @@ bool AP_Arming::gps_checks(bool report)
                          (double)distance_m);
             return false;
         }
-#if defined(GPS_BLENDED_INSTANCE)
+#if AP_GPS_BLENDED_ENABLED
         if (!gps.blend_health_check()) {
             check_failed(ARMING_CHECK_GPS, report, "GPS blending unhealthy");
             return false;
@@ -925,6 +916,7 @@ bool AP_Arming::mission_checks(bool report)
 
 bool AP_Arming::rangefinder_checks(bool report)
 {
+#if AP_RANGEFINDER_ENABLED
     if (check_enabled(ARMING_CHECK_RANGEFINDER)) {
         RangeFinder *range = RangeFinder::get_singleton();
         if (range == nullptr) {
@@ -937,6 +929,7 @@ bool AP_Arming::rangefinder_checks(bool report)
             return false;
         }
     }
+#endif
 
     return true;
 }
@@ -1055,6 +1048,11 @@ bool AP_Arming::system_checks(bool report)
             return false;
         }
 
+        if (AP_Param::get_eeprom_full()) {
+            check_failed(ARMING_CHECK_PARAMETERS, report, "parameter storage full");
+            return false;
+        }
+        
         // check main loop rate is at least 90% of expected value
         const float actual_loop_rate = AP::scheduler().get_filtered_loop_rate_hz();
         const uint16_t expected_loop_rate = AP::scheduler().get_loop_rate_hz();
@@ -1098,6 +1096,11 @@ bool AP_Arming::system_checks(bool report)
     }
 
     if (check_enabled(ARMING_CHECK_PARAMETERS)) {
+#if !AP_GPS_BLENDED_ENABLED
+        if (!blending_auto_switch_checks(report)) {
+            return false;
+        }
+#endif
 #if AP_RPM_ENABLED
         auto *rpm = AP::rpm();
         if (rpm && !rpm->arming_checks(sizeof(buffer), buffer)) {
@@ -1242,9 +1245,8 @@ bool AP_Arming::can_checks(bool report)
                 }
                 case AP_CAN::Protocol::USD1:
                 case AP_CAN::Protocol::TOFSenseP:
-                case AP_CAN::Protocol::NanoRadar_NRA24:
+                case AP_CAN::Protocol::NanoRadar:
                 case AP_CAN::Protocol::Benewake:
-                case AP_CAN::Protocol::MR72:
                 {
                     for (uint8_t j = i; j; j--) {
                         if (AP::can().get_driver_type(i) == AP::can().get_driver_type(j-1)) {
@@ -1289,6 +1291,13 @@ bool AP_Arming::fence_checks(bool display_failure)
         check_failed(display_failure, "%s", fail_msg);
     }
 
+#if AP_SDCARD_STORAGE_ENABLED
+    if (fence->failed_sdcard_storage() || StorageManager::storage_failed()) {
+        check_failed(display_failure, "Failed to open fence storage");
+        return false;
+    }
+#endif
+    
     return false;
 }
 #endif  // AP_FENCE_ENABLED
@@ -1632,6 +1641,9 @@ bool AP_Arming::pre_arm_checks(bool report)
 #if AP_OPENDRONEID_ENABLED
         &  opendroneid_checks(report)
 #endif
+#if AP_ARMING_CRASHDUMP_ACK_ENABLED
+        & crashdump_checks(report)
+#endif
         &  serial_protocol_checks(report)
         &  estop_checks(report);
 
@@ -1682,6 +1694,43 @@ bool AP_Arming::arm_checks(AP_Arming::Method method)
 
     return true;
 }
+
+#if !AP_GPS_BLENDED_ENABLED
+bool AP_Arming::blending_auto_switch_checks(bool report)
+{
+    if (AP::gps().get_auto_switch_type() == 2) {
+        if (report) {
+            check_failed(ARMING_CHECK_GPS, true, "GPS_AUTO_SWITCH==2 but no blending");
+        }
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if AP_ARMING_CRASHDUMP_ACK_ENABLED
+bool AP_Arming::crashdump_checks(bool report)
+{
+    if (hal.util->last_crash_dump_size() == 0) {
+        // no crash dump data
+        return true;
+    }
+
+    // see if the user has acknowledged the failure and wants to fly anyway:
+    if (crashdump_ack.acked) {
+        // they may have acked the problem, that doesn't mean we don't
+        // continue to warn them they're on thin ice:
+        if (report) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CrashDump data detected");
+        }
+        return true;
+    }
+
+    check_failed(ARMING_CHECK_PARAMETERS, true, "CrashDump data detected");
+
+    return false;
+}
+#endif  // AP_ARMING_CRASHDUMP_ACK_ENABLED
 
 bool AP_Arming::mandatory_checks(bool report)
 {
@@ -2004,3 +2053,5 @@ AP_Arming &arming()
 };
 
 #pragma GCC diagnostic pop
+
+#endif  // AP_ARMING_ENABLED

@@ -73,6 +73,11 @@ void Plane::throttle_slew_limit(SRV_Channel::Aux_servo_function_t func)
 */
 bool Plane::suppress_throttle(void)
 {
+    if (control_mode == &mode_manual) {
+        // Throttle is never suppressed in manual mode
+        return false;
+    }
+
 #if PARACHUTE == ENABLED
     if (control_mode->does_auto_throttle() && parachute.release_initiated()) {
         // throttle always suppressed in auto-throttle modes after parachute release initiated
@@ -343,42 +348,39 @@ void Plane::airbrake_update(void)
 }
 
 /*
-  setup servos for idle mode
+  setup servos for idle wiggle mode
   Idle mode is used during balloon launch to keep servos still, apart
   from occasional wiggle to prevent freezing up
  */
-void Plane::set_servos_idle(void)
+void ModeAuto::wiggle_servos()
 {
+    // This is only active while in AUTO running NAV_ALTITUDE_WAIT with wiggle_time > 0
+    if (wiggle.last_ms == 0) {
+        return;
+    }
+
     int16_t servo_value;
     // move over full range for 2 seconds
-    if (auto_state.idle_wiggle_stage != 0) {
-        auto_state.idle_wiggle_stage += 2;
+    if (wiggle.stage != 0) {
+        wiggle.stage += 2;
     }
-    if (auto_state.idle_wiggle_stage == 0) {
+    if (wiggle.stage == 0) {
         servo_value = 0;
-    } else if (auto_state.idle_wiggle_stage < 50) {
-        servo_value = auto_state.idle_wiggle_stage * (4500 / 50);
-    } else if (auto_state.idle_wiggle_stage < 100) {
-        servo_value = (100 - auto_state.idle_wiggle_stage) * (4500 / 50);        
-    } else if (auto_state.idle_wiggle_stage < 150) {
-        servo_value = (100 - auto_state.idle_wiggle_stage) * (4500 / 50);        
-    } else if (auto_state.idle_wiggle_stage < 200) {
-        servo_value = (auto_state.idle_wiggle_stage-200) * (4500 / 50);        
+    } else if (wiggle.stage < 50) {
+        servo_value = wiggle.stage * (4500 / 50);
+    } else if (wiggle.stage < 100) {
+        servo_value = (100 - wiggle.stage) * (4500 / 50);        
+    } else if (wiggle.stage < 150) {
+        servo_value = (100 - wiggle.stage) * (4500 / 50);        
+    } else if (wiggle.stage < 200) {
+        servo_value = (wiggle.stage-200) * (4500 / 50);        
     } else {
-        auto_state.idle_wiggle_stage = 0;
+        wiggle.stage = 0;
         servo_value = 0;
     }
     SRV_Channels::set_output_scaled(SRV_Channel::k_aileron, servo_value);
     SRV_Channels::set_output_scaled(SRV_Channel::k_elevator, servo_value);
     SRV_Channels::set_output_scaled(SRV_Channel::k_rudder, servo_value);
-
-    SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);
-    SRV_Channels::set_output_scaled(SRV_Channel::k_throttleLeft, 0.0);
-    SRV_Channels::set_output_scaled(SRV_Channel::k_throttleRight, 0.0);
-
-    SRV_Channels::set_output_to_trim(SRV_Channel::k_throttle);
-    SRV_Channels::set_output_to_trim(SRV_Channel::k_throttleLeft);
-    SRV_Channels::set_output_to_trim(SRV_Channel::k_throttleRight);
 
 }
 
@@ -547,19 +549,19 @@ float Plane::apply_throttle_limits(float throttle_in)
 void Plane::set_throttle(void)
 {
 
-    if (!arming.is_armed_and_safety_off()) {
-        // Always set 0 scaled even if overriding to zero pwm.
-        // This ensures slew limits and other functions using the scaled value pick up in the correct place
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttleLeft, 0.0);
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttleRight, 0.0);
+    // Update voltage scaling
+    g2.fwd_batt_cmp.update();
 
-        if (arming.arming_required() == AP_Arming::Required::YES_ZERO_PWM) {
-            SRV_Channels::set_output_limit(SRV_Channel::k_throttle, SRV_Channel::Limit::ZERO_PWM);
-            SRV_Channels::set_output_limit(SRV_Channel::k_throttleLeft, SRV_Channel::Limit::ZERO_PWM);
-            SRV_Channels::set_output_limit(SRV_Channel::k_throttleRight, SRV_Channel::Limit::ZERO_PWM);
-        }
-        return;
+    if (control_mode->use_battery_compensation()) {
+        // Apply voltage compensation to throttle output from flight mode
+        const float throttle = g2.fwd_batt_cmp.apply_throttle(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, throttle);
+    }
+
+    if (control_mode->use_throttle_limits()) {
+        // Apply min/max throttle limits
+        const float limited_throttle = apply_throttle_limits(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle));
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, limited_throttle);
     }
 
     if (suppress_throttle()) {
@@ -576,29 +578,8 @@ void Plane::set_throttle(void)
             SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);
 
         }
-        return;
     }
 
-    // Update voltage scaling
-    g2.fwd_batt_cmp.update();
-
-#if AP_SCRIPTING_ENABLED
-    if (nav_scripting_active()) {
-            SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, plane.nav_scripting.throttle_pct);
-    }
-#endif
-
-    if (control_mode->use_battery_compensation()) {
-        // Apply voltage compensation to throttle output from flight mode
-        const float throttle = g2.fwd_batt_cmp.apply_throttle(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle));
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, throttle);
-    }
-
-    if (control_mode->use_throttle_limits()) {
-        // Apply min/max throttle limits
-        const float limited_throttle = apply_throttle_limits(SRV_Channels::get_output_scaled(SRV_Channel::k_throttle));
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, limited_throttle);
-    }
 }
 
 /*
@@ -850,8 +831,20 @@ void Plane::set_servos(void)
         landing.override_servos();
     }
 
-    if (control_mode != &mode_manual) {
-        set_throttle();
+    set_throttle();
+
+    if ((control_mode != &mode_manual) && !arming.is_armed_and_safety_off()) {
+        // Always set 0 scaled even if overriding to zero pwm.
+        // This ensures slew limits and other functions using the scaled value pick up in the correct place
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, 0.0);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttleLeft, 0.0);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttleRight, 0.0);
+
+        if (arming.arming_required() == AP_Arming::Required::YES_ZERO_PWM) {
+            SRV_Channels::set_output_limit(SRV_Channel::k_throttle, SRV_Channel::Limit::ZERO_PWM);
+            SRV_Channels::set_output_limit(SRV_Channel::k_throttleLeft, SRV_Channel::Limit::ZERO_PWM);
+            SRV_Channels::set_output_limit(SRV_Channel::k_throttleRight, SRV_Channel::Limit::ZERO_PWM);
+        }
     }
 
     // Warn AHRS if we might take off soon

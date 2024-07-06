@@ -39,11 +39,15 @@ void Copter::Log_Write_Control_Tuning()
         target_climb_rate_cms = pos_control->get_vel_target_z_cms();
     }
 
-    // get surface tracking alts
     float desired_rangefinder_alt;
+#if AP_RANGEFINDER_ENABLED
     if (!surface_tracking.get_target_dist_for_logging(desired_rangefinder_alt)) {
         desired_rangefinder_alt = AP::logger().quiet_nan();
     }
+#else
+    // get surface tracking alts
+    desired_rangefinder_alt = AP::logger().quiet_nan();
+#endif
 
     struct log_Control_Tuning pkt = {
         LOG_PACKET_HEADER_INIT(LOG_CONTROL_TUNING_MSG),
@@ -56,7 +60,11 @@ void Copter::Log_Write_Control_Tuning()
         inav_alt            : inertial_nav.get_position_z_up_cm() * 0.01f,
         baro_alt            : baro_alt,
         desired_rangefinder_alt : desired_rangefinder_alt,
+#if AP_RANGEFINDER_ENABLED
         rangefinder_alt     : surface_tracking.get_dist_for_logging(),
+#else
+        rangefinder_alt     : AP::logger().quiet_nanf(),
+#endif
         terr_alt            : terr_alt,
         target_climb_rate   : target_climb_rate_cms,
         climb_rate          : int16_t(inertial_nav.get_velocity_z_up_cms()) // float -> int16_t
@@ -560,6 +568,11 @@ const struct LogStructure Copter::log_structure[] = {
       "GUIA",  "QBffffffff",    "TimeUS,Type,Roll,Pitch,Yaw,RollRt,PitchRt,YawRt,Thrust,ClimbRt", "s-dddkkk-n", "F-000000-0" , true },
 };
 
+uint8_t Copter::get_num_log_structures() const
+{
+    return ARRAY_SIZE(log_structure);
+}
+
 void Copter::Log_Write_Vehicle_Startup_Messages()
 {
     // only 200(?) bytes are guaranteed by AP_Logger
@@ -569,11 +582,6 @@ void Copter::Log_Write_Vehicle_Startup_Messages()
     logger.Write_Mode((uint8_t)flightmode->mode_number(), control_mode_reason);
     ahrs.Log_Write_Home_And_Origin();
     gps.Write_AP_Logger_Log_Startup_messages();
-}
-
-void Copter::log_init(void)
-{
-    logger.Init(log_structure, ARRAY_SIZE(log_structure));
 }
 
 #endif // HAL_LOGGING_ENABLED

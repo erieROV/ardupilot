@@ -5,8 +5,8 @@
 #include "AP_Logger_Backend.h"
 
 #include "AP_Logger_File.h"
-#include "AP_Logger_DataFlash.h"
-#include "AP_Logger_W25N01GV.h"
+#include "AP_Logger_Flash_JEDEC.h"
+#include "AP_Logger_W25NXX.h"
 #include "AP_Logger_MAVLink.h"
 
 #include <AP_InternalError/AP_InternalError.h>
@@ -36,7 +36,7 @@ extern const AP_HAL::HAL& hal;
 #endif
 
 #ifndef HAL_LOGGING_DATAFLASH_DRIVER
-#define HAL_LOGGING_DATAFLASH_DRIVER AP_Logger_DataFlash
+#define HAL_LOGGING_DATAFLASH_DRIVER AP_Logger_Flash_JEDEC
 #endif
 
 #ifndef HAL_LOGGING_STACK_SIZE
@@ -193,8 +193,7 @@ const AP_Param::GroupInfo AP_Logger::var_info[] = {
 
 #define streq(x, y) (!strcmp(x, y))
 
-AP_Logger::AP_Logger(const AP_Int32 &log_bitmask)
-    : _log_bitmask(log_bitmask)
+AP_Logger::AP_Logger()
 {
     AP_Param::setup_object_defaults(this, var_info);
     if (_singleton != nullptr) {
@@ -204,8 +203,10 @@ AP_Logger::AP_Logger(const AP_Int32 &log_bitmask)
     _singleton = this;
 }
 
-void AP_Logger::Init(const struct LogStructure *structures, uint8_t num_types)
+void AP_Logger::init(const AP_Int32 &log_bitmask, const struct LogStructure *structures, uint8_t num_types)
 {
+    _log_bitmask = &log_bitmask;
+
     // convert from 8 bit to 16 bit LOG_FILE_BUFSIZE
     _params.file_bufsize.convert_parameter_width(AP_PARAM_INT8);
 
@@ -246,7 +247,7 @@ void AP_Logger::Init(const struct LogStructure *structures, uint8_t num_types)
             return;
         }
         LoggerMessageWriter_DFLogStart *message_writer =
-            new LoggerMessageWriter_DFLogStart();
+            NEW_NOTHROW LoggerMessageWriter_DFLogStart();
         if (message_writer == nullptr)  {
             AP_BoardConfig::allocation_error("message writer");
         }
@@ -629,7 +630,7 @@ bool AP_Logger::should_log(const uint32_t mask) const
 {
     bool armed = vehicle_is_armed();
 
-    if (!(mask & _log_bitmask)) {
+    if (!(mask & *_log_bitmask)) {
         return false;
     }
     if (!armed && !log_while_disarmed()) {
@@ -713,7 +714,7 @@ void AP_Logger::save_format_Replay(const void *pBuffer)
 {
     if (((uint8_t *)pBuffer)[2] == LOG_FORMAT_MSG) {
         struct log_Format *fmt = (struct log_Format *)pBuffer;
-        struct log_write_fmt *f = new log_write_fmt;
+        struct log_write_fmt *f = NEW_NOTHROW log_write_fmt;
         f->msg_type = fmt->type;
         f->msg_len = fmt->length;
         f->name = strndup(fmt->name, sizeof(fmt->name));
@@ -1566,7 +1567,10 @@ void AP_Logger::prepare_at_arming_sys_file_logging()
      */
     static const char *log_content_filenames[] = {
         "@SYS/uarts.txt",
+#ifdef HAL_DEBUG_BUILD
+        // logging dma.txt has a performance impact
         "@SYS/dma.txt",
+#endif
         "@SYS/memory.txt",
         "@SYS/threads.txt",
         "@SYS/timers.txt",
@@ -1635,13 +1639,13 @@ void AP_Logger::log_file_content(const char *filename)
 void AP_Logger::log_file_content(FileContent &file_content, const char *filename)
 {
     WITH_SEMAPHORE(file_content.sem);
-    auto *file = new file_list;
+    auto *file = NEW_NOTHROW file_list;
     if (file == nullptr) {
         return;
     }
     // make copy to allow original to go out of scope
     const size_t len = strlen(filename)+1;
-    char * tmp_filename = new char[len];
+    char * tmp_filename = NEW_NOTHROW char[len];
     if (tmp_filename == nullptr) {
         delete file;
         return;

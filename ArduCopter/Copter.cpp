@@ -149,6 +149,9 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 
     SCHED_TASK(rc_loop,              250,    130,  3),
     SCHED_TASK(throttle_loop,         50,     75,  6),
+#if AP_FENCE_ENABLED
+    SCHED_TASK(fence_check,           25,    100,  7),
+#endif
     SCHED_TASK_CLASS(AP_GPS,               &copter.gps,                 update,          50, 200,   9),
 #if AP_OPTICALFLOW_ENABLED
     SCHED_TASK_CLASS(AP_OpticalFlow,          &copter.optflow,             update,         200, 160,  12),
@@ -161,7 +164,7 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 #endif
     SCHED_TASK(auto_disarm_check,     10,     50,  27),
     SCHED_TASK(auto_trim,             10,     75,  30),
-#if RANGEFINDER_ENABLED == ENABLED
+#if AP_RANGEFINDER_ENABLED
     SCHED_TASK(read_rangefinder,      20,    100,  33),
 #endif
 #if HAL_PROXIMITY_ENABLED
@@ -183,7 +186,6 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 #if AP_SERVORELAYEVENTS_ENABLED
     SCHED_TASK_CLASS(AP_ServoRelayEvents,  &copter.ServoRelayEvents,      update_events, 50,  75,  60),
 #endif
-    SCHED_TASK_CLASS(AP_Baro,              &copter.barometer,             accumulate,    50,  90,  63),
 #if AC_PRECLAND_ENABLED
     SCHED_TASK(update_precland,      400,     50,  69),
 #endif
@@ -236,9 +238,6 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
 #if AP_TERRAIN_AVAILABLE
     SCHED_TASK(terrain_update,        10,    100, 144),
 #endif
-#if AP_GRIPPER_ENABLED
-    SCHED_TASK_CLASS(AP_Gripper,           &copter.g2.gripper,          update,          10,  75, 147),
-#endif
 #if AP_WINCH_ENABLED
     SCHED_TASK_CLASS(AP_Winch,             &copter.g2.winch,            update,          50,  50, 150),
 #endif
@@ -273,6 +272,22 @@ void Copter::get_scheduler_tasks(const AP_Scheduler::Task *&tasks,
 
 constexpr int8_t Copter::_failsafe_priorities[7];
 
+
+#if AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
+#if MODE_GUIDED_ENABLED == ENABLED
+// set target location (for use by external control and scripting)
+bool Copter::set_target_location(const Location& target_loc)
+{
+    // exit if vehicle is not in Guided mode or Auto-Guided mode
+    if (!flightmode->in_guided_mode()) {
+        return false;
+    }
+
+    return mode_guided.set_destination(target_loc);
+}
+#endif //MODE_GUIDED_ENABLED == ENABLED
+#endif //AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
+
 #if AP_SCRIPTING_ENABLED
 #if MODE_GUIDED_ENABLED == ENABLED
 // start takeoff to given altitude (for use by scripting)
@@ -288,17 +303,6 @@ bool Copter::start_takeoff(float alt)
         return true;
     }
     return false;
-}
-
-// set target location (for use by scripting)
-bool Copter::set_target_location(const Location& target_loc)
-{
-    // exit if vehicle is not in Guided mode or Auto-Guided mode
-    if (!flightmode->in_guided_mode()) {
-        return false;
-    }
-
-    return mode_guided.set_destination(target_loc);
 }
 
 // set target position (for use by scripting)
@@ -442,6 +446,32 @@ bool Copter::has_ekf_failsafed() const
     return failsafe.ekf;
 }
 
+// get target location (for use by scripting)
+bool Copter::get_target_location(Location& target_loc)
+{
+    return flightmode->get_wp(target_loc);
+}
+
+/*
+  update_target_location() acts as a wrapper for set_target_location
+ */
+bool Copter::update_target_location(const Location &old_loc, const Location &new_loc)
+{
+    /*
+      by checking the caller has provided the correct old target
+      location we prevent a race condition where the user changes mode
+      or commands a different target in the controlling lua script
+    */
+    Location next_WP_loc;
+    flightmode->get_wp(next_WP_loc);
+    if (!old_loc.same_loc_as(next_WP_loc) ||
+         old_loc.get_alt_frame() != new_loc.get_alt_frame()) {
+        return false;
+    }
+
+    return set_target_location(new_loc);
+}
+
 #endif // AP_SCRIPTING_ENABLED
 
 // returns true if vehicle is landing. Only used by Lua scripts
@@ -522,9 +552,11 @@ void Copter::loop_rate_logging()
         Log_Write_Attitude();
         Log_Write_PIDS(); // only logs if PIDS bitmask is set
     }
+#if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
     if (should_log(MASK_LOG_FTN_FAST)) {
         AP::ins().write_notch_log_messages();
     }
+#endif
     if (should_log(MASK_LOG_IMU_FAST)) {
         AP::ins().Write_IMU();
     }
@@ -624,12 +656,6 @@ void Copter::three_hz_loop()
 
     // check for deadreckoning failsafe
     failsafe_deadreckon_check();
-
-#if AP_FENCE_ENABLED
-    // check if we have breached a fence
-    fence_check();
-#endif // AP_FENCE_ENABLED
-
 
     // update ch6 in flight tuning
     tuning();
@@ -770,7 +796,9 @@ void Copter::update_altitude()
     if (should_log(MASK_LOG_CTUN)) {
         Log_Write_Control_Tuning();
         if (!should_log(MASK_LOG_FTN_FAST)) {
+#if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
             AP::ins().write_notch_log_messages();
+#endif
 #if HAL_GYROFFT_ENABLED
             gyro_fft.write_log_messages();
 #endif
@@ -820,9 +848,6 @@ bool Copter::get_rate_ef_targets(Vector3f& rate_ef_targets) const
  */
 Copter::Copter(void)
     :
-#if HAL_LOGGING_ENABLED
-    logger(g.log_bitmask),
-#endif
     flight_modes(&g.flight_mode1),
     simple_cos_yaw(1.0f),
     super_simple_cos_yaw(1.0),

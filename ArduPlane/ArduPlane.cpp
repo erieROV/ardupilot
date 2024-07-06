@@ -81,8 +81,9 @@ const AP_Scheduler::Task Plane::scheduler_tasks[] = {
     SCHED_TASK_CLASS(AP_ServoRelayEvents, &plane.ServoRelayEvents, update_events, 50, 150,  63),
 #endif
     SCHED_TASK_CLASS(AP_BattMonitor, &plane.battery, read,   10, 300,  66),
-    SCHED_TASK_CLASS(AP_Baro, &plane.barometer, accumulate,  50, 150,  69),
+#if AP_RANGEFINDER_ENABLED
     SCHED_TASK(read_rangefinder,       50,    100, 78),
+#endif
 #if AP_ICENGINE_ENABLED
     SCHED_TASK_CLASS(AP_ICEngine,      &plane.g2.ice_control, update,     10, 100,  81),
 #endif
@@ -132,11 +133,11 @@ const AP_Scheduler::Task Plane::scheduler_tasks[] = {
 #if HAL_BUTTON_ENABLED
     SCHED_TASK_CLASS(AP_Button, &plane.button, update, 5, 100, 150),
 #endif
-#if AP_GRIPPER_ENABLED
-    SCHED_TASK_CLASS(AP_Gripper, &plane.g2.gripper, update, 10, 75, 156),
-#endif
 #if AP_LANDINGGEAR_ENABLED
     SCHED_TASK(landing_gear_update, 5, 50, 159),
+#endif
+#if AC_PRECLAND_ENABLED
+    SCHED_TASK(precland_update, 400, 50, 160),
 #endif
 };
 
@@ -273,9 +274,11 @@ void Plane::update_logging25(void)
 
     if (should_log(MASK_LOG_CTUN)) {
         Log_Write_Control_Tuning();
+#if AP_INERTIALSENSOR_HARMONICNOTCH_ENABLED
         if (!should_log(MASK_LOG_NOTCH_FULLRATE)) {
             AP::ins().write_notch_log_messages();
         }
+#endif
 #if HAL_GYROFFT_ENABLED
         gyro_fft.write_log_messages();
 #endif
@@ -600,7 +603,8 @@ void Plane::update_alt()
                                                  get_takeoff_pitch_min_cd(),
                                                  throttle_nudge,
                                                  tecs_hgt_afe(),
-                                                 aerodynamic_load_factor);
+                                                 aerodynamic_load_factor,
+                                                 g.pitch_trim.get());
     }
 }
 
@@ -698,7 +702,7 @@ bool Plane::trigger_land_abort(const float climb_to_alt_m)
         plane.is_land_command(mission_id);
     if (is_in_landing) {
         // fly a user planned abort pattern if available
-        if (plane.mission.jump_to_abort_landing_sequence()) {
+        if (plane.have_position && plane.mission.jump_to_abort_landing_sequence(plane.current_loc)) {
             return true;
         }
 
@@ -748,7 +752,9 @@ float Plane::tecs_hgt_afe(void)
     float hgt_afe;
     if (flight_stage == AP_FixedWing::FlightStage::LAND) {
         hgt_afe = height_above_target();
+#if AP_RANGEFINDER_ENABLED
         hgt_afe -= rangefinder_correction();
+#endif
     } else {
         // when in normal flight we pass the hgt_afe as relative
         // altitude to home
@@ -827,7 +833,7 @@ bool Plane::set_target_location(const Location &target_loc)
 #endif //AP_SCRIPTING_ENABLED || AP_EXTERNAL_CONTROL_ENABLED
 
 #if AP_SCRIPTING_ENABLED
-// set target location (for use by scripting)
+// get target location (for use by scripting)
 bool Plane::get_target_location(Location& target_loc)
 {
     switch (control_mode->mode_number()) {
@@ -856,11 +862,22 @@ bool Plane::get_target_location(Location& target_loc)
  */
 bool Plane::update_target_location(const Location &old_loc, const Location &new_loc)
 {
-    if (!old_loc.same_loc_as(next_WP_loc)) {
+    /*
+      by checking the caller has provided the correct old target
+      location we prevent a race condition where the user changes mode
+      or commands a different target in the controlling lua script
+     */
+    if (!old_loc.same_loc_as(next_WP_loc) ||
+        old_loc.get_alt_frame() != new_loc.get_alt_frame()) {
         return false;
     }
     next_WP_loc = new_loc;
-    next_WP_loc.change_alt_frame(old_loc.get_alt_frame());
+
+#if HAL_QUADPLANE_ENABLED
+    if (control_mode == &mode_qland || control_mode == &mode_qloiter) {
+        mode_qloiter.last_target_loc_set_ms = AP_HAL::millis();
+    }
+#endif
 
     return true;
 }
@@ -882,7 +899,8 @@ bool Plane::set_velocity_match(const Vector2f &velocity)
 bool Plane::set_land_descent_rate(float descent_rate)
 {
 #if HAL_QUADPLANE_ENABLED
-    if (quadplane.in_vtol_land_descent()) {
+    if (quadplane.in_vtol_land_descent() ||
+        control_mode == &mode_qland) {
         quadplane.poscontrol.override_descent_rate = descent_rate;
         quadplane.poscontrol.last_override_descent_ms = AP_HAL::millis();
         return true;
@@ -948,5 +966,17 @@ bool Plane::flight_option_enabled(FlightOptions flight_option) const
 {
     return g2.flight_options & flight_option;
 }
+
+#if AC_PRECLAND_ENABLED
+void Plane::precland_update(void)
+{
+    // alt will be unused if we pass false through as the second parameter:
+#if AP_RANGEFINDER_ENABLED
+    return g2.precland.update(rangefinder_state.height_estimate*100, rangefinder_state.in_range);
+#else
+    return g2.precland.update(0, false);
+#endif
+}
+#endif
 
 AP_HAL_MAIN_CALLBACKS(&plane);
